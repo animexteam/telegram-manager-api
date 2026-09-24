@@ -28,12 +28,13 @@ log = logging.getLogger("automations")
 class AutomationManager:
     FILENAME = "automations.json"  # gist filename + local filename
 
-    def __init__(self, data_dir: Path, tele_manager, gist_store=None):
+    def __init__(self, data_dir: Path, tele_manager, gist_store=None, workflow_engine=None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.local_file = self.data_dir / self.FILENAME
         self.tele_manager = tele_manager
         self.gist = gist_store
+        self.workflow_engine = workflow_engine  # optional — enables workflow_id
 
         # scheduler
         self.scheduler = AsyncIOScheduler(
@@ -172,7 +173,21 @@ class AutomationManager:
 
         result: Dict[str, Any]
         try:
-            if action == "send_message":
+            # Branch 1: workflow-based automation (preferred — dynamic)
+            if auto.get("workflow_id") and self.workflow_engine:
+                wf = self.workflow_engine.get_workflow(auto["workflow_id"])
+                if not wf:
+                    raise ValueError(f"workflow {auto['workflow_id']} not found")
+                result = await self.workflow_engine.execute_workflow(
+                    account_id=acc_id, steps=wf["steps"]
+                )
+                # Bump workflow run_count + last_run too
+                wf["run_count"] = wf.get("run_count", 0) + 1
+                wf["last_run"] = int(time.time())
+                wf["last_result"] = {"ok": True}
+                self.workflow_engine._save_workflows()
+            # Branch 2: simple action (legacy backward-compat)
+            elif action == "send_message":
                 if not peer or not message:
                     raise ValueError("send_message requires peer + message")
                 result = await self.tele_manager.send_message(acc_id, peer, message)
@@ -242,11 +257,14 @@ class AutomationManager:
         self,
         name: str,
         account_id: str,
-        action: str,
-        peer: Optional[str],
-        message: Optional[str],
         cron: str,
         enabled: bool = True,
+        # NEW: workflow-based (preferred for anything dynamic)
+        workflow_id: Optional[str] = None,
+        # LEGACY: simple action (still supported, wrapped as 1-step workflow internally)
+        action: str = "send_message",
+        peer: Optional[str] = None,
+        message: Optional[str] = None,
         limit: int = 5,
         click_media: bool = True,
     ) -> Dict[str, Any]:
@@ -262,21 +280,29 @@ class AutomationManager:
         except Exception as e:
             raise ValueError(f"invalid cron expression: {e}")
 
-        # validate action
-        if action not in ("send_message", "click_ads"):
-            raise ValueError(f"unsupported action: {action}")
-        if action == "send_message":
-            if not peer or not message:
-                raise ValueError("send_message requires peer + message")
-        elif action == "click_ads":
-            if not peer:
-                raise ValueError("click_ads requires peer")
+        # If workflow_id is provided, validate it exists
+        if workflow_id:
+            if not self.workflow_engine:
+                raise ValueError("workflow_id provided but workflow_engine not configured")
+            if not self.workflow_engine.get_workflow(workflow_id):
+                raise ValueError(f"workflow {workflow_id} not found")
+        else:
+            # Validate legacy action
+            if action not in ("send_message", "click_ads"):
+                raise ValueError(f"unsupported action: {action}")
+            if action == "send_message":
+                if not peer or not message:
+                    raise ValueError("send_message requires peer + message")
+            elif action == "click_ads":
+                if not peer:
+                    raise ValueError("click_ads requires peer")
 
         aid = f"auto_{uuid.uuid4().hex[:10]}"
         auto = {
             "id": aid,
             "name": name,
             "account_id": account_id,
+            "workflow_id": workflow_id,  # None for simple-action automations
             "action": action,
             "peer": peer,
             "message": message,
@@ -304,8 +330,8 @@ class AutomationManager:
             raise KeyError(f"automation {aid} not found")
 
         # allowed patchable fields
-        for k in ("name", "account_id", "action", "peer", "message", "cron",
-                  "enabled", "limit", "click_media"):
+        for k in ("name", "account_id", "workflow_id", "action", "peer", "message",
+                  "cron", "enabled", "limit", "click_media"):
             if k in patch and patch[k] is not None:
                 # validate critical fields
                 if k == "cron":
@@ -318,6 +344,11 @@ class AutomationManager:
                         self.tele_manager.require_account(patch[k])
                     except Exception as e:
                         raise ValueError(f"invalid account_id: {e}")
+                if k == "workflow_id" and patch[k]:
+                    if not self.workflow_engine:
+                        raise ValueError("workflow_engine not configured")
+                    if not self.workflow_engine.get_workflow(patch[k]):
+                        raise ValueError(f"workflow {patch[k]} not found")
                 if k == "action" and patch[k] not in ("send_message", "click_ads"):
                     raise ValueError(f"unsupported action: {patch[k]}")
                 auto[k] = patch[k]
