@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from tele_manager import TeleManager
 from gist_store import GistStorage
+from automations import AutomationManager
 
 
 # ----------------------------------------------------------------------
@@ -65,6 +66,13 @@ manager = TeleManager(
     gist_store=GistStorage(GITHUB_GIST_TOKEN, GIST_ID) if GITHUB_GIST_TOKEN else None,
 )
 
+# Automation manager — scheduled task runner (cron-driven)
+automations_mgr = AutomationManager(
+    DATA_DIR,
+    tele_manager=manager,
+    gist_store=GistStorage(GITHUB_GIST_TOKEN, GIST_ID) if GITHUB_GIST_TOKEN else None,
+)
+
 
 # ----------------------------------------------------------------------
 # STARTUP — auto-pull sessions from gist so Render sleep doesn't lose them
@@ -84,6 +92,14 @@ async def _startup():
                         "Call POST /sync/init to create a gist, then set GIST_ID env var.")
     else:
         log.info("startup: gist persistence not configured (GITHUB_GIST_TOKEN empty)")
+
+    # Start the automation scheduler (also loads automations.json from gist)
+    try:
+        automations_mgr.start()
+        log.info("startup: automations scheduler started, %d job(s) loaded",
+                 len(automations_mgr.list_automations()))
+    except Exception as e:
+        log.error("startup: automations scheduler failed: %s", e)
 
 
 # ----------------------------------------------------------------------
@@ -351,10 +367,110 @@ async def sync_push():
 
 
 # ----------------------------------------------------------------------
+# AUTOMATIONS (scheduled tasks)
+# ----------------------------------------------------------------------
+class AutomationCreateReq(BaseModel):
+    name: str
+    account_id: str
+    action: str = "send_message"
+    peer: Optional[str] = None
+    message: Optional[str] = None
+    cron: str                       # standard 5-field cron (UTC)
+    enabled: bool = True
+
+
+class AutomationUpdateReq(BaseModel):
+    name: Optional[str] = None
+    account_id: Optional[str] = None
+    action: Optional[str] = None
+    peer: Optional[str] = None
+    message: Optional[str] = None
+    cron: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+@app.get("/automations", tags=["automations"], dependencies=[Depends(require_key)])
+async def list_automations():
+    return automations_mgr.list_automations()
+
+
+@app.post("/automations", tags=["automations"], dependencies=[Depends(require_key)])
+async def create_automation(req: AutomationCreateReq):
+    """Create a new scheduled automation.
+
+    Cron format (5 fields, UTC):
+      minute hour day-of-month month day-of-week
+
+    Examples:
+      "0 9 * * *"        → daily at 09:00 UTC
+      "*/30 * * * *"     → every 30 minutes
+      "0 9 * * 1-5"      → weekdays at 09:00 UTC
+      "0 0 1 * *"        → 1st of every month at midnight UTC
+    """
+    try:
+        return automations_mgr.create_automation(
+            name=req.name,
+            account_id=req.account_id,
+            action=req.action,
+            peer=req.peer,
+            message=req.message,
+            cron=req.cron,
+            enabled=req.enabled,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/automations/{aid}", tags=["automations"], dependencies=[Depends(require_key)])
+async def get_automation(aid: str):
+    a = automations_mgr.get_automation(aid)
+    if not a:
+        raise HTTPException(404, f"automation {aid} not found")
+    return a
+
+
+@app.patch("/automations/{aid}", tags=["automations"], dependencies=[Depends(require_key)])
+async def update_automation(aid: str, req: AutomationUpdateReq):
+    try:
+        updated = automations_mgr.update_automation(aid, req.dict(exclude_unset=True))
+        return updated
+    except KeyError:
+        raise HTTPException(404, f"automation {aid} not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/automations/{aid}", tags=["automations"], dependencies=[Depends(require_key)])
+async def delete_automation(aid: str):
+    deleted = automations_mgr.delete_automation(aid)
+    if not deleted:
+        raise HTTPException(404, f"automation {aid} not found")
+    return {"deleted": aid}
+
+
+@app.post("/automations/{aid}/trigger", tags=["automations"], dependencies=[Depends(require_key)])
+async def trigger_automation_now(aid: str):
+    """Run an automation immediately, outside its cron schedule.
+
+    Useful for testing. Result is async — check /automations/{aid} for last_result.
+    """
+    try:
+        return automations_mgr.trigger_now(aid)
+    except KeyError:
+        raise HTTPException(404, f"automation {aid} not found")
+
+
+# ----------------------------------------------------------------------
 # SHUTDOWN — disconnect all transient clients
 # ----------------------------------------------------------------------
 @app.on_event("shutdown")
 async def _shutdown():
+    # stop scheduler first
+    try:
+        automations_mgr.stop()
+    except Exception as e:
+        log.warning("shutdown: automations stop error: %s", e)
+
     for store in (manager._login_clients, manager._op_clients):
         for c in list(store.values()):
             try:
