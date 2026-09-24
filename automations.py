@@ -176,6 +176,12 @@ class AutomationManager:
                 if not peer or not message:
                     raise ValueError("send_message requires peer + message")
                 result = await self.tele_manager.send_message(acc_id, peer, message)
+            elif action == "click_ads":
+                if not peer:
+                    raise ValueError("click_ads requires peer")
+                limit = int(auto.get("limit", 5))
+                click_media = bool(auto.get("click_media", True))
+                result = await self.tele_manager.click_ads(acc_id, peer, limit, click_media)
             else:
                 raise ValueError(f"unknown action: {action}")
 
@@ -241,6 +247,8 @@ class AutomationManager:
         message: Optional[str],
         cron: str,
         enabled: bool = True,
+        limit: int = 5,
+        click_media: bool = True,
     ) -> Dict[str, Any]:
         # validate account exists
         try:
@@ -255,11 +263,14 @@ class AutomationManager:
             raise ValueError(f"invalid cron expression: {e}")
 
         # validate action
-        if action not in ("send_message",):
+        if action not in ("send_message", "click_ads"):
             raise ValueError(f"unsupported action: {action}")
         if action == "send_message":
             if not peer or not message:
                 raise ValueError("send_message requires peer + message")
+        elif action == "click_ads":
+            if not peer:
+                raise ValueError("click_ads requires peer")
 
         aid = f"auto_{uuid.uuid4().hex[:10]}"
         auto = {
@@ -271,6 +282,8 @@ class AutomationManager:
             "message": message,
             "cron": cron,
             "enabled": enabled,
+            "limit": limit,
+            "click_media": click_media,
             "created_at": int(time.time()),
             "updated_at": int(time.time()),
             "run_count": 0,
@@ -291,7 +304,8 @@ class AutomationManager:
             raise KeyError(f"automation {aid} not found")
 
         # allowed patchable fields
-        for k in ("name", "account_id", "action", "peer", "message", "cron", "enabled"):
+        for k in ("name", "account_id", "action", "peer", "message", "cron",
+                  "enabled", "limit", "click_media"):
             if k in patch and patch[k] is not None:
                 # validate critical fields
                 if k == "cron":
@@ -304,7 +318,7 @@ class AutomationManager:
                         self.tele_manager.require_account(patch[k])
                     except Exception as e:
                         raise ValueError(f"invalid account_id: {e}")
-                if k == "action" and patch[k] not in ("send_message",):
+                if k == "action" and patch[k] not in ("send_message", "click_ads"):
                     raise ValueError(f"unsupported action: {patch[k]}")
                 auto[k] = patch[k]
 
