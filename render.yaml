@@ -1,0 +1,24 @@
+# Render Blueprint — see https://render.com/docs/blueprint-spec
+# This file lets Render auto-create the service on `render blueprint deploy`.
+
+services:
+  - type: web
+    name: telegram-manager-api
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /ping
+    autoDeploy: true
+    envVars:
+      - key: MASTER_API_KEY
+        sync: false           # set this manually in Render dashboard after deploy
+      - key: GITHUB_GIST_TOKEN
+        sync: false           # GitHub token with `gist` scope
+      - key: GIST_ID
+        sync: false           # set after first POST /sync/init call
+      - key: DATA_DIR
+        value: /opt/render/project/src/data
+      - key: PYTHON_VERSION
+        value: 3.12.14
