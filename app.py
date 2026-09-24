@@ -175,6 +175,7 @@ class VisitReq(BaseModel):
 class ClickAdsReq(BaseModel):
     peer: str
     limit: int = 5
+    click_media: bool = False   # also send media=True flag (for ads with photo/video)
 
 
 # ----------------------------------------------------------------------
@@ -282,7 +283,7 @@ async def visit_chat(acc_id: str, req: VisitReq):
 
 @app.post("/accounts/{acc_id}/click-ads", tags=["ops"], dependencies=[Depends(require_key)])
 async def click_ads(acc_id: str, req: ClickAdsReq):
-    return await manager.click_ads(acc_id, req.peer, req.limit)
+    return await manager.click_ads(acc_id, req.peer, req.limit, req.click_media)
 
 
 # ----------------------------------------------------------------------
