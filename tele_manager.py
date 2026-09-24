@@ -534,6 +534,104 @@ class TeleManager:
             "ads": ads,
         }
 
+    async def fetch_ads(self, acc_id: str, peer: str, limit: int = 20) -> Dict[str, Any]:
+        """Fetch sponsored messages WITHOUT clicking. Returns ads with random_id_hex.
+
+        Used by workflows that need to inspect ads first, then click each one
+        with custom delays / refresh between clicks.
+        """
+        client = await self._get_client(acc_id)
+        ent = await client.get_entity(peer)
+        try:
+            res = await client(GetSponsoredMessagesRequest(peer=ent))
+        except Exception as e:
+            return {"ok": False, "peer": peer, "error": f"getSponsoredMessages failed: {e}"}
+
+        msgs = getattr(res, "messages", []) or []
+        ads = []
+        for sm in msgs[:limit]:
+            rid = getattr(sm, "random_id", None)
+            ads.append({
+                "random_id_hex": rid.hex() if isinstance(rid, bytes) else (
+                    str(rid) if rid is not None else None
+                ),
+                "url": getattr(sm, "url", None),
+                "title": getattr(sm, "title", None),
+                "message": (getattr(sm, "message", None) or "")[:300],
+                "button_text": getattr(sm, "button_text", None),
+                "has_media": getattr(sm, "media", None) is not None,
+            })
+        return {
+            "ok": True,
+            "peer": peer,
+            "peer_id": getattr(ent, "id", None),
+            "ads_count": len(ads),
+            "ads": ads,
+        }
+
+    async def click_one_ad(
+        self,
+        acc_id: str,
+        peer: str,
+        random_id_hex: str,
+        click_media: bool = True,
+    ) -> Dict[str, Any]:
+        """Click ONE specific sponsored ad by its random_id_hex.
+
+        Workflow-friendly: pair with `fetch_ads` + a loop in a workflow to
+        click ads one at a time with custom delays between each click.
+
+        Args:
+            random_id_hex: hex string of the ad's random_id (from fetch_ads response)
+            click_media: also send media=True (registers media view for ads with photo/video)
+        """
+        from telethon.tl.functions.messages import ClickSponsoredMessageRequest
+
+        client = await self._get_client(acc_id)
+        ent = await client.get_entity(peer)
+
+        # Convert hex string back to bytes
+        try:
+            rid_bytes = bytes.fromhex(random_id_hex)
+        except ValueError:
+            return {"ok": False, "error": f"invalid random_id_hex: {random_id_hex}"}
+
+        result = {"ok": False, "random_id_hex": random_id_hex, "click_response": None, "error": None}
+        try:
+            resp = await client(ClickSponsoredMessageRequest(random_id=rid_bytes))
+            result["ok"] = True
+            result["click_response"] = repr(resp)
+        except Exception as e:
+            result["error"] = f"{type(e).__name__}: {e}"
+            return result
+
+        if click_media:
+            try:
+                resp_m = await client(ClickSponsoredMessageRequest(random_id=rid_bytes, media=True))
+                result["media_click_response"] = repr(resp_m)
+            except Exception as e:
+                result["media_click_error"] = str(e)
+
+        return result
+
+    async def disconnect_client(self, acc_id: str) -> Dict[str, Any]:
+        """Forcefully disconnect a Telegram client (to save quota / avoid 24/7 online).
+
+        Use after a workflow finishes clicking ads so the account appears offline
+        to Telegram (less suspicious than always-online).
+        """
+        disconnected = False
+        for store in (self._login_clients, self._op_clients):
+            c = store.pop(acc_id, None)
+            if c:
+                try:
+                    if c.is_connected():
+                        await c.disconnect()
+                    disconnected = True
+                except Exception:
+                    pass
+        return {"disconnected": disconnected, "account_id": acc_id}
+
 
 # ---------------------------------------------------------------------- #
 # SERIALIZERS
