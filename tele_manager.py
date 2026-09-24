@@ -463,45 +463,75 @@ class TeleManager:
             "messages": msgs,
         }
 
-    async def click_ads(self, acc_id: str, peer: str, limit: int = 5) -> Dict[str, Any]:
-        """Fetch sponsored messages in a channel and 'click' them (mark clicked + return URLs)."""
+    async def click_ads(self, acc_id: str, peer: str, limit: int = 5, click_media: bool = False) -> Dict[str, Any]:
+        """Fetch sponsored messages in a channel and click them via Telegram's
+        ClickSponsoredMessageRequest.
+
+        Returns ad metadata (title, message, button_text, url, random_id) +
+        click_result (ok: bool, response, error) for each ad.
+
+        Args:
+            click_media: if True, also send media=True (registers the click as
+                         "user viewed the media" — for ads with photo/video).
+        """
         client = await self._get_client(acc_id)
         ent = await client.get_entity(peer)
 
-        sponsored = []
         try:
             res = await client(GetSponsoredMessagesRequest(peer=ent))
         except Exception as e:
             return {"ok": False, "peer": peer, "error": f"getSponsoredMessages failed: {e}"}
 
-        # Telethon may expose messages under .messages
         msgs = getattr(res, "messages", []) or []
+        from telethon.tl.functions.messages import ClickSponsoredMessageRequest
+
         clicked = 0
+        ads = []
         for sm in msgs[:limit]:
-            url = getattr(sm, "url", None) or getattr(getattr(sm, "sponsor", None), "url", None)
             random_id = getattr(sm, "random_id", None)
-            try:
-                # Best-effort: try to report a click via raw TL.
-                # Method may or may not exist across Telethon versions; guard with try/except.
-                from telethon.tl.functions.messages import ClickSponsoredMessageRequest
-                if random_id is not None:
-                    await client(ClickSponsoredMessageRequest(peer=ent, random_id=random_id))
+            url = getattr(sm, "url", None)
+            title = getattr(sm, "title", None)
+            message = getattr(sm, "message", None)
+            button_text = getattr(sm, "button_text", None)
+            has_media = getattr(sm, "media", None) is not None
+
+            click_info = {"ok": False, "response": None, "error": None}
+            if random_id is not None:
+                try:
+                    resp = await client(ClickSponsoredMessageRequest(random_id=random_id))
+                    click_info["ok"] = True
+                    click_info["response"] = repr(resp)
                     clicked += 1
-            except Exception:
-                # Fallback: just record the URL so the caller can visit it manually.
-                pass
-            sponsored.append({
-                "random_id": str(random_id) if random_id is not None else None,
+                    # Also send media=True if the ad has media and caller requested it
+                    if click_media and has_media:
+                        try:
+                            resp_m = await client(ClickSponsoredMessageRequest(
+                                random_id=random_id, media=True,
+                            ))
+                            click_info["media_click_response"] = repr(resp_m)
+                        except Exception as e2:
+                            click_info["media_click_error"] = str(e2)
+                except Exception as e:
+                    click_info["error"] = f"{type(e).__name__}: {e}"
+
+            ads.append({
+                "random_id_hex": random_id.hex() if isinstance(random_id, bytes) else (
+                    str(random_id) if random_id is not None else None
+                ),
                 "url": url,
-                "title": getattr(getattr(sm, "sponsor", None), "title", None),
-                "clicked": clicked > 0,
+                "title": title,
+                "message": (message or "")[:300],
+                "button_text": button_text,
+                "has_media": has_media,
+                "click_result": click_info,
             })
         return {
             "ok": True,
             "peer": peer,
-            "sponsored_count": len(sponsored),
+            "peer_id": getattr(ent, "id", None),
+            "sponsored_count": len(ads),
             "clicked_count": clicked,
-            "ads": sponsored,
+            "ads": ads,
         }
 
 
