@@ -12,7 +12,7 @@ import time
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from tele_manager import TeleManager
 from gist_store import GistStorage
 from automations import AutomationManager
+from workflow_engine import WorkflowEngine
 
 
 # ----------------------------------------------------------------------
@@ -66,11 +67,20 @@ manager = TeleManager(
     gist_store=GistStorage(GITHUB_GIST_TOKEN, GIST_ID) if GITHUB_GIST_TOKEN else None,
 )
 
+# Workflow engine — generic action registry + multi-step executor
+_gist = GistStorage(GITHUB_GIST_TOKEN, GIST_ID) if GITHUB_GIST_TOKEN else None
+workflow_engine = WorkflowEngine(
+    tele_manager=manager,
+    gist_store=_gist,
+    data_dir=DATA_DIR,
+)
+
 # Automation manager — scheduled task runner (cron-driven)
 automations_mgr = AutomationManager(
     DATA_DIR,
     tele_manager=manager,
-    gist_store=GistStorage(GITHUB_GIST_TOKEN, GIST_ID) if GITHUB_GIST_TOKEN else None,
+    gist_store=_gist,
+    workflow_engine=workflow_engine,
 )
 
 
@@ -95,6 +105,13 @@ async def _startup():
 
     # Start the automation scheduler (also loads automations.json from gist)
     try:
+        # Load workflows from gist (or local)
+        workflow_engine._load_workflows()
+        if workflow_engine.pull_from_gist():
+            log.info("startup: pulled %d workflow(s) from gist", len(workflow_engine.list_workflows()))
+        else:
+            log.info("startup: %d workflow(s) loaded from local file", len(workflow_engine.list_workflows()))
+
         automations_mgr.start()
         log.info("startup: automations scheduler started, %d job(s) loaded",
                  len(automations_mgr.list_automations()))
@@ -373,11 +390,14 @@ async def sync_push():
 class AutomationCreateReq(BaseModel):
     name: str
     account_id: str
+    cron: str                       # standard 5-field cron (UTC)
+    enabled: bool = True
+    # NEW: workflow-based (preferred for anything dynamic / multi-step)
+    workflow_id: Optional[str] = None
+    # LEGACY: simple single-action (still supported)
     action: str = "send_message"
     peer: Optional[str] = None
     message: Optional[str] = None
-    cron: str                       # standard 5-field cron (UTC)
-    enabled: bool = True
     # For click_ads action only:
     limit: int = 5
     click_media: bool = True
@@ -386,6 +406,7 @@ class AutomationCreateReq(BaseModel):
 class AutomationUpdateReq(BaseModel):
     name: Optional[str] = None
     account_id: Optional[str] = None
+    workflow_id: Optional[str] = None
     action: Optional[str] = None
     peer: Optional[str] = None
     message: Optional[str] = None
@@ -417,11 +438,12 @@ async def create_automation(req: AutomationCreateReq):
         return automations_mgr.create_automation(
             name=req.name,
             account_id=req.account_id,
+            cron=req.cron,
+            enabled=req.enabled,
+            workflow_id=req.workflow_id,
             action=req.action,
             peer=req.peer,
             message=req.message,
-            cron=req.cron,
-            enabled=req.enabled,
             limit=req.limit,
             click_media=req.click_media,
         )
@@ -466,6 +488,165 @@ async def trigger_automation_now(aid: str):
         return automations_mgr.trigger_now(aid)
     except KeyError:
         raise HTTPException(404, f"automation {aid} not found")
+
+
+# ----------------------------------------------------------------------
+# WORKFLOWS (multi-step dynamic task definitions)
+# ----------------------------------------------------------------------
+class WorkflowCreateReq(BaseModel):
+    name: str
+    description: str = ""
+    steps: List[Dict]   # list of step dicts (flexible schema)
+
+
+class WorkflowUpdateReq(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    steps: Optional[List[Dict]] = None
+
+
+@app.get("/workflows", tags=["workflows"], dependencies=[Depends(require_key)])
+async def list_workflows():
+    return workflow_engine.list_workflows()
+
+
+@app.post("/workflows", tags=["workflows"], dependencies=[Depends(require_key)])
+async def create_workflow(req: WorkflowCreateReq):
+    """Create a multi-step workflow.
+
+    Example body:
+    {
+      "name": "Click 20 ads × 4 clicks each",
+      "steps": [
+        {"action": "fetch_ads", "params": {"peer": "@X", "limit": 20}, "store_as": "ads"},
+        {"action": "loop", "over": "ads", "as": "ad", "delay_between": 120, "steps": [
+          {"action": "click_one_ad", "params": {"peer": "@X", "random_id_hex": "{{ad.random_id_hex}}"}, "delay_after": 45},
+          {"action": "click_one_ad", "params": {"peer": "@X", "random_id_hex": "{{ad.random_id_hex}}"}, "delay_after": 60},
+          {"action": "click_one_ad", "params": {"peer": "@X", "random_id_hex": "{{ad.random_id_hex}}"}, "delay_after": 50},
+          {"action": "click_one_ad", "params": {"peer": "@X", "random_id_hex": "{{ad.random_id_hex}}"}, "delay_after": 90}
+        ]},
+        {"action": "disconnect"}
+      ]
+    }
+    """
+    return workflow_engine.create_workflow(req.name, req.steps, req.description)
+
+
+@app.get("/workflows/{wid}", tags=["workflows"], dependencies=[Depends(require_key)])
+async def get_workflow(wid: str):
+    wf = workflow_engine.get_workflow(wid)
+    if not wf:
+        raise HTTPException(404, f"workflow {wid} not found")
+    return wf
+
+
+@app.patch("/workflows/{wid}", tags=["workflows"], dependencies=[Depends(require_key)])
+async def update_workflow(wid: str, req: WorkflowUpdateReq):
+    try:
+        return workflow_engine.update_workflow(wid, req.dict(exclude_unset=True))
+    except KeyError:
+        raise HTTPException(404, f"workflow {wid} not found")
+
+
+@app.delete("/workflows/{wid}", tags=["workflows"], dependencies=[Depends(require_key)])
+async def delete_workflow(wid: str):
+    if not workflow_engine.delete_workflow(wid):
+        raise HTTPException(404, f"workflow {wid} not found")
+    return {"deleted": wid}
+
+
+class WorkflowExecuteReq(BaseModel):
+    account_id: str
+
+
+@app.post("/workflows/{wid}/execute", tags=["workflows"], dependencies=[Depends(require_key)])
+async def execute_workflow_now(wid: str, req: WorkflowExecuteReq):
+    """Run a workflow immediately on a specific account (outside its scheduled cron).
+
+    Returns the full step-by-step result.
+    """
+    wf = workflow_engine.get_workflow(wid)
+    if not wf:
+        raise HTTPException(404, f"workflow {wid} not found")
+    result = await workflow_engine.execute_workflow(req.account_id, wf["steps"])
+    # bump stats
+    wf["run_count"] = wf.get("run_count", 0) + 1
+    wf["last_run"] = int(time.time())
+    wf["last_result"] = {"ok": True}
+    workflow_engine._save_workflows()
+    return result
+
+
+# ----------------------------------------------------------------------
+# ACTIONS (registry — built-in + custom)
+# ----------------------------------------------------------------------
+@app.get("/actions", tags=["actions"], dependencies=[Depends(require_key)])
+async def list_actions():
+    """List all registered actions (built-in + custom)."""
+    return {"actions": workflow_engine.list_actions()}
+
+
+class ActionRegisterReq(BaseModel):
+    name: str
+    source_code: str        # MUST define `async def action(client, params) -> dict`
+
+
+@app.post("/actions/register", tags=["actions"], dependencies=[Depends(require_key)])
+async def register_custom_action(req: ActionRegisterReq):
+    """Register a custom action via Python source code.
+
+    source_code MUST define:
+        async def action(client, params):
+            # client: telethon TelegramClient (already connected + authorized)
+            # params: dict of params from the workflow step
+            # return: dict (will be stored if store_as is set)
+            return {"ok": True, "your_data": ...}
+
+    Example:
+    {
+      "name": "my_custom_action",
+      "source_code": "async def action(client, params):
+          peer = params['peer']
+          ent = await client.get_entity(peer)
+          return {'ok': True, 'peer_id': ent.id}"
+    }
+    """
+    try:
+        name = workflow_engine.register_custom(req.name, req.source_code)
+        return {"registered": name, "actions_now": workflow_engine.list_actions()}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+class RunCodeReq(BaseModel):
+    account_id: str
+    code: str
+    params: Optional[Dict] = None
+
+
+@app.post("/actions/run-code", tags=["actions"], dependencies=[Depends(require_key)])
+async def run_custom_code(req: RunCodeReq):
+    """Run arbitrary Python code immediately on an account's client.
+
+    Available vars in code: client, params, asyncio, json, time, result.
+    Set `result` variable to return it.
+
+    Example:
+    {
+      "account_id": "acc_money23",
+      "code": "me = await client.get_me()
+    result = {'my_id': me.id, 'my_name': me.first_name}"
+    }
+    """
+    client = await manager._get_client(req.account_id)
+    ns = {"client": client, "params": req.params or {},
+          "asyncio": __import__("asyncio"), "json": __import__("json"),
+          "time": __import__("time"), "result": None}
+    try:
+        exec(req.code, ns)
+        return {"ok": True, "result": ns.get("result")}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 # ----------------------------------------------------------------------
