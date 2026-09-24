@@ -378,6 +378,9 @@ class AutomationCreateReq(BaseModel):
     message: Optional[str] = None
     cron: str                       # standard 5-field cron (UTC)
     enabled: bool = True
+    # For click_ads action only:
+    limit: int = 5
+    click_media: bool = True
 
 
 class AutomationUpdateReq(BaseModel):
@@ -388,6 +391,8 @@ class AutomationUpdateReq(BaseModel):
     message: Optional[str] = None
     cron: Optional[str] = None
     enabled: Optional[bool] = None
+    limit: Optional[int] = None
+    click_media: Optional[bool] = None
 
 
 @app.get("/automations", tags=["automations"], dependencies=[Depends(require_key)])
@@ -417,6 +422,8 @@ async def create_automation(req: AutomationCreateReq):
             message=req.message,
             cron=req.cron,
             enabled=req.enabled,
+            limit=req.limit,
+            click_media=req.click_media,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
